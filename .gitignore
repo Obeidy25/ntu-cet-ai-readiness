@@ -11,16 +11,7 @@ __pycache__/
 venv/
 env/
 
-# Vector database & runtime data (regenerable, not needed in repo)
-chroma_db/
-*.db
-*.sqlite3
 
-# OS/editor junk
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
 
 # Logs
 *.log

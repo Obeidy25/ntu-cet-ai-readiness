@@ -8,3 +8,6 @@ pymupdf
 openai
 python-dotenv
 Pillow
+openpyxl
+python-docx
+reportlab

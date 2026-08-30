@@ -3,11 +3,285 @@ import streamlit.components.v1 as components
 import requests
 import uuid
 import re
+import io
+from datetime import datetime
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Table, TableStyle
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
 
 BACKEND_URL = "http://localhost:8000"
 
+
+def generate_gap_analysis_pdf(doc_a: str, doc_b: str, analysis_text: str) -> bytes:
+    """
+    Generates a formatted PDF report for the ITU AI Readiness Gap Analysis.
+    Returns the PDF as bytes ready for download.
+    """
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    import os
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=2 * cm,
+        leftMargin=2 * cm,
+        topMargin=2 * cm,
+        bottomMargin=2 * cm,
+    )
+
+    # === Register a Unicode-capable font that supports Arabic + Latin ===
+    font_name = "Helvetica"
+    font_name_bold = "Helvetica-Bold"
+    for candidate in [
+        r"C:\Windows\Fonts\tahoma.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
+    ]:
+        if os.path.exists(candidate):
+            try:
+                pdfmetrics.registerFont(TTFont("UniFont", candidate))
+                font_name = "UniFont"
+                break
+            except Exception:
+                continue
+    for bold_candidate in [
+        r"C:\Windows\Fonts\tahomabd.ttf",
+        r"C:\Windows\Fonts\arialbd.ttf",
+        r"C:\Windows\Fonts\seguisb.ttf",
+    ]:
+        if os.path.exists(bold_candidate):
+            try:
+                pdfmetrics.registerFont(TTFont("UniFontBold", bold_candidate))
+                font_name_bold = "UniFontBold"
+                break
+            except Exception:
+                continue
+
+    styles = getSampleStyleSheet()
+
+    # === Arabic text reshaping support ===
+    try:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+        _has_arabic_support = True
+    except ImportError:
+        _has_arabic_support = False
+
+    def reshape_arabic(text: str) -> str:
+        """Reshape Arabic text for correct PDF rendering (RTL + glyph joining)."""
+        if not _has_arabic_support:
+            return text
+        # Only reshape segments that contain Arabic characters
+        if not re.search(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]', text):
+            return text
+        try:
+            reshaped = arabic_reshaper.reshape(text)
+            return get_display(reshaped)
+        except Exception:
+            return text
+
+    # === Normalize problematic Unicode characters ===
+    def normalize_text(text: str) -> str:
+        replacements = {
+            '\u2011': '-', '\u2010': '-', '\u2012': '-', '\u2013': '-',
+            '\u2014': '-', '\u2015': '-', '\u2018': "'", '\u2019': "'",
+            '\u201c': '"', '\u201d': '"', '\u2026': '...',
+            '\u00a0': ' ', '\u200b': '', '\u200c': '', '\u200d': '', '\ufeff': '',
+            '\u2022': '-',
+        }
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        return text
+
+    def prepare_text_for_pdf(text: str) -> str:
+        """Normalize Unicode AND reshape Arabic for PDF rendering."""
+        text = normalize_text(text)
+        # Reshape Arabic segments within the text
+        def reshape_match(m):
+            return reshape_arabic(m.group(0))
+        # Find Arabic runs (including surrounding punctuation/spaces)
+        text = re.sub(
+            r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]'
+            r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF\s\d\.,;:\-\(\)\"\']*',
+            reshape_match,
+            text
+        )
+        return text
+
+    analysis_text = prepare_text_for_pdf(analysis_text)
+    doc_a = normalize_text(doc_a)
+    doc_b = normalize_text(doc_b)
+
+    title_style = ParagraphStyle("ReportTitle", parent=styles["Title"],
+        fontName=font_name_bold, fontSize=18, textColor=colors.HexColor("#1a237e"),
+        spaceAfter=6, alignment=TA_CENTER)
+    subtitle_style = ParagraphStyle("SubTitle", parent=styles["Normal"],
+        fontName=font_name, fontSize=11, textColor=colors.HexColor("#5c6bc0"),
+        spaceAfter=4, alignment=TA_CENTER)
+    meta_style = ParagraphStyle("Meta", parent=styles["Normal"],
+        fontName=font_name, fontSize=10, textColor=colors.HexColor("#455a64"),
+        spaceAfter=3, leftIndent=10)
+    heading_style = ParagraphStyle("SectionHeading", parent=styles["Heading2"],
+        fontName=font_name_bold, fontSize=13, textColor=colors.HexColor("#283593"),
+        spaceBefore=14, spaceAfter=4)
+    body_style = ParagraphStyle("Body", parent=styles["Normal"],
+        fontName=font_name, fontSize=10, textColor=colors.HexColor("#212121"),
+        spaceAfter=5, leading=15)
+    bullet_style = ParagraphStyle("Bullet", parent=styles["Normal"],
+        fontName=font_name, fontSize=10, textColor=colors.HexColor("#212121"),
+        spaceAfter=3, leftIndent=18, bulletIndent=6, leading=14)
+
+    def safe_paragraph(text: str, style) -> Paragraph:
+        try:
+            return Paragraph(text, style)
+        except Exception:
+            plain = re.sub(r'<[^>]+>', '', text)
+            try:
+                return Paragraph(plain, style)
+            except Exception:
+                return Paragraph("(rendering error)", style)
+
+    story = []
+
+    # === Header ===
+    story.append(safe_paragraph("ITU AI Readiness 2.0", title_style))
+    story.append(safe_paragraph("Policy Gap Analysis Report", subtitle_style))
+    story.append(Spacer(1, 0.3 * cm))
+    story.append(HRFlowable(width="100%", thickness=2, color=colors.HexColor("#3949ab")))
+    story.append(Spacer(1, 0.4 * cm))
+
+    # === Metadata table ===
+    meta_data = [
+        [safe_paragraph("<b>Document A:</b>", meta_style), safe_paragraph(doc_a.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"), meta_style)],
+        [safe_paragraph("<b>Document B:</b>", meta_style), safe_paragraph(doc_b.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"), meta_style)],
+        [safe_paragraph("<b>Framework:</b>", meta_style), safe_paragraph("ITU AI Readiness 2.0 - 13 Dimensions &amp; ITU-T Y.3172 Pipeline", meta_style)],
+        [safe_paragraph("<b>Generated:</b>", meta_style), safe_paragraph(datetime.now().strftime("%Y-%m-%d %H:%M"), meta_style)],
+    ]
+    meta_table = Table(meta_data, colWidths=[4 * cm, 13 * cm])
+    meta_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f5f5f5")),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.HexColor("#eeeeee"), colors.HexColor("#fafafa")]),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#c5cae9")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#c5cae9")),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(meta_table)
+    story.append(Spacer(1, 0.5 * cm))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#9fa8da")))
+
+    # === Analysis body ===
+    in_table = False
+    table_data = []
+    in_mermaid = False
+
+    def flush_table():
+        if not table_data:
+            return
+        max_cols = max(len(row) for row in table_data)
+        for row in table_data:
+            while len(row) < max_cols:
+                row.append(safe_paragraph("", body_style))
+        col_widths = [(17.0 / max_cols) * cm for _ in range(max_cols)]
+        tbl = Table(table_data, colWidths=col_widths)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8eaf6")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#1a237e")),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+            ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#ffffff")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#ffffff"), colors.HexColor("#f8f9ff")]),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#c5cae9")),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(tbl)
+        story.append(Spacer(1, 0.4 * cm))
+        table_data.clear()
+
+    for line in analysis_text.splitlines():
+        stripped = line.strip()
+
+        # Skip mermaid code blocks
+        if stripped.startswith("```mermaid"):
+            in_mermaid = True
+            continue
+        if in_mermaid:
+            if stripped.startswith("```"):
+                in_mermaid = False
+            continue
+        if stripped.startswith("```"):
+            continue
+
+        # Markdown table line?
+        if stripped.startswith("|") and stripped.endswith("|"):
+            in_table = True
+            # Skip separator lines (|---|---|)
+            if re.match(r"^\|[\s\-:]+\|", stripped) and not re.search(r'[a-zA-Z\u0600-\u06FF]', stripped):
+                continue
+            clean_line = stripped.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            clean_line = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", clean_line)
+            clean_line = re.sub(r"\*(.+?)\*", r"<i>\1</i>", clean_line)
+            cells = clean_line.split("|")[1:-1]
+            row = [safe_paragraph(cell.strip(), body_style) for cell in cells]
+            table_data.append(row)
+            continue
+
+        if in_table:
+            flush_table()
+            in_table = False
+
+        if not stripped:
+            story.append(Spacer(1, 0.2 * cm))
+            continue
+
+        clean = stripped.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        clean = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", clean)
+        clean = re.sub(r"\*(.+?)\*", r"<i>\1</i>", clean)
+
+        if stripped.startswith("# "):
+            story.append(safe_paragraph(clean[2:], heading_style))
+        elif stripped.startswith("## "):
+            story.append(safe_paragraph(clean[3:], heading_style))
+        elif stripped.startswith("### "):
+            story.append(safe_paragraph(clean[4:], heading_style))
+        elif stripped.startswith("---"):
+            story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#c5cae9")))
+        elif stripped.startswith("- ") or stripped.startswith("* "):
+            story.append(safe_paragraph("- " + clean[2:], bullet_style))
+        elif re.match(r"^\d+\.", stripped):
+            story.append(safe_paragraph(clean, bullet_style))
+        else:
+            story.append(safe_paragraph(clean, body_style))
+
+    if in_table:
+        flush_table()
+
+    # === Footer ===
+    story.append(Spacer(1, 0.8 * cm))
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#3949ab")))
+    story.append(Spacer(1, 0.2 * cm))
+    story.append(safe_paragraph(
+        "Generated by NTU CET RAG Policy Analysis System - Powered by ITU AI Readiness 2.0 Framework",
+        ParagraphStyle("Footer", parent=styles["Normal"], fontName=font_name, fontSize=8,
+                       textColor=colors.HexColor("#9e9e9e"), alignment=TA_CENTER)
+    ))
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
 st.set_page_config(
-    page_title="Chat with your PDFs",
+    page_title="Chat with your Documents",
     page_icon="📄",
     layout="wide",
 )
@@ -60,6 +334,46 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+def sanitize_mermaid_code(code: str) -> str:
+    """
+    Sanitizes LLM-generated Mermaid code to prevent parse errors.
+    Strips HTML tags, fixes unquoted node labels, and cleans up common issues.
+    """
+    # Remove any HTML tags that the LLM may have injected (e.g., <div>, </div>, <br>)
+    code = re.sub(r'</?[a-zA-Z][^>]*>', '', code)
+    # Remove zero-width and non-breaking spaces
+    code = code.replace('\u200b', '').replace('\u00a0', ' ')
+    # Fix node labels: ensure text inside brackets [] is quoted if it contains spaces or special chars
+    # Pattern: A[unquoted text with spaces] -> A["unquoted text with spaces"]
+    def quote_node_label(m):
+        prefix = m.group(1)  # e.g., A
+        bracket_open = m.group(2)  # [ or (
+        label = m.group(3)  # the text inside
+        bracket_close = m.group(4)  # ] or )
+        # Already quoted
+        if label.startswith('"') and label.endswith('"'):
+            return f'{prefix}{bracket_open}{label}{bracket_close}'
+        # Needs quoting if it has spaces, parens, Arabic, or special chars
+        if re.search(r'[\s\(\)\u0600-\u06FF&<>]', label):
+            escaped = label.replace('"', "'")
+            return f'{prefix}{bracket_open}"{escaped}"{bracket_close}'
+        return m.group(0)
+
+    code = re.sub(
+        r'([A-Za-z0-9_]+)\s*(\[)\s*([^\]]+?)\s*(\])',
+        quote_node_label,
+        code
+    )
+    code = re.sub(
+        r'([A-Za-z0-9_]+)\s*(\()\s*([^\)]+?)\s*(\))',
+        quote_node_label,
+        code
+    )
+    # Remove completely empty lines that could confuse the parser
+    lines = [l for l in code.splitlines() if l.strip()]
+    return '\n'.join(lines)
+
+
 def render_content_with_mermaid(content: str, key_prefix: str = "msg"):
     """
     Renders message content with automatic Arabic RTL detection and Mermaid diagram support.
@@ -83,16 +397,26 @@ def render_content_with_mermaid(content: str, key_prefix: str = "msg"):
             else:
                 st.markdown(part)
         else:
-            mermaid_code = part.strip()
+            mermaid_code = sanitize_mermaid_code(part.strip())
             html_code = f"""
             <div id="mermaid-container-{key_prefix}-{i}" style="display:flex; justify-content:center; align-items:center; background:#0f172a; border:1px solid #334155; border-radius:8px; padding:16px; margin:10px 0; overflow-x:auto;">
                 <pre class="mermaid" style="margin:0; background:transparent; font-family:sans-serif;">
 {mermaid_code}
                 </pre>
             </div>
+            <div id="mermaid-error-{key_prefix}-{i}" style="display:none; background:#1e1b2e; border:1px solid #7c3aed; border-radius:8px; padding:16px; margin:10px 0; color:#c4b5fd; font-family:monospace; font-size:0.85rem;">
+                <b>⚠️ Diagram could not be rendered.</b><br>
+                <pre style="white-space:pre-wrap; margin-top:8px; color:#94a3b8;">{mermaid_code}</pre>
+            </div>
             <script type="module">
                 import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
-                mermaid.initialize({{ startOnLoad: true, theme: 'dark' }});
+                mermaid.initialize({{ startOnLoad: false, theme: 'dark' }});
+                try {{
+                    await mermaid.run({{ querySelector: '#mermaid-container-{key_prefix}-{i} .mermaid' }});
+                }} catch (e) {{
+                    document.getElementById('mermaid-container-{key_prefix}-{i}').style.display = 'none';
+                    document.getElementById('mermaid-error-{key_prefix}-{i}').style.display = 'block';
+                }}
             </script>
             """
             components.html(html_code, height=350, scrolling=True)
@@ -116,7 +440,7 @@ if "pending_turn" not in st.session_state:
 
 is_busy = (st.session_state.pending_turn is not None)
 
-st.title("📄 Chat with your PDFs")
+st.title("📄 Chat with your Documents")
 st.caption("Powered by RAG — Retrieval Augmented Generation")
 
 with st.sidebar:
@@ -176,7 +500,7 @@ with st.sidebar:
     with col_btn:
         if st.button("🔄", key="ref_models_btn", disabled=is_busy, help="Refresh available models from server"):
             try:
-                st.session_state.available_models = requests.get(f"{BACKEND_URL}/models", timeout=3).json()
+                st.session_state.available_models = requests.get(f"{BACKEND_URL}/models", timeout=10).json()
                 st.rerun()
             except Exception:
                 pass
@@ -185,7 +509,7 @@ with st.sidebar:
     # Fetch available models from backend once and store in session state
     if "available_models" not in st.session_state:
         try:
-            st.session_state.available_models = requests.get(f"{BACKEND_URL}/models", timeout=3).json()
+            st.session_state.available_models = requests.get(f"{BACKEND_URL}/models", timeout=10).json()
         except Exception:
             st.session_state.available_models = {"local_models": [], "local_available": False, "cloud_providers": {}}
 
@@ -209,8 +533,8 @@ with st.sidebar:
     else:
         provider = st.selectbox(
             "Provider",
-            options=list(models_info["cloud_providers"].keys()) or ["openai", "anthropic", "gemini"],
-            format_func=lambda p: {"openai": "OpenAI (GPT)", "anthropic": "Anthropic (Claude)", "gemini": "Google (Gemini)"}.get(p, p),
+            options=list(models_info["cloud_providers"].keys()) or ["openai", "anthropic", "gemini", "deepseek", "moonshot"],
+            format_func=lambda p: {"openai": "OpenAI (GPT)", "anthropic": "Anthropic (Claude)", "gemini": "Google (Gemini)", "deepseek": "DeepSeek (V3/Reasoner)", "moonshot": "Moonshot (Kimi)"}.get(p, p),
             disabled=is_busy,
         )
         model_options = models_info["cloud_providers"].get(provider, [])
@@ -244,9 +568,9 @@ with st.sidebar:
     st.header("Your Documents")
 
     uploaded_file = st.file_uploader(
-        "Upload a PDF",
-        type=["pdf"],
-        help="Upload any PDF and start asking questions",
+        "Upload a Document",
+        type=["pdf", "xlsx", "xls", "docx"],
+        help="Upload a PDF, Excel (.xlsx/.xls), or Word (.docx) file and start asking questions",
         disabled=is_busy,
     )
 
@@ -258,17 +582,26 @@ with st.sidebar:
     )
 
     if uploaded_file:
-        if st.button("Ingest PDF", type="primary", use_container_width=True, disabled=is_busy):
-            with st.spinner("Reading, chunking, and embedding your PDF..."):
+        if st.button("Ingest Document", type="primary", use_container_width=True, disabled=is_busy):
+            with st.spinner("Reading, chunking, and embedding your document..."):
                 form_data = {
                     "enable_vision": "true" if enable_vision else "false",
                     "vision_provider": provider,
                     "vision_model": model if model else "llama3.2-vision",
                     "vision_api_key": api_key if api_key else "",
                 }
+                # Determine MIME type based on file extension
+                ext = uploaded_file.name.rsplit(".", 1)[-1].lower() if "." in uploaded_file.name else ""
+                mime_map = {
+                    "pdf": "application/pdf",
+                    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "xls": "application/vnd.ms-excel",
+                    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                }
+                mime_type = mime_map.get(ext, "application/octet-stream")
                 response = requests.post(
                     f"{BACKEND_URL}/ingest",
-                    files={"file": (uploaded_file.name, uploaded_file, "application/pdf")},
+                    files={"file": (uploaded_file.name, uploaded_file, mime_type)},
                     data=form_data,
                 )
 
@@ -422,7 +755,7 @@ with tab_chat:
         # Capture sliding window of prior conversation turns
         history_payload = [
             {"role": m["role"], "content": m["content"]}
-            for m in st.session_state.messages[-4:]
+            for m in st.session_state.messages[-8:]
         ]
 
         with st.chat_message("user"):
@@ -512,7 +845,7 @@ with tab_compare:
         available_docs = []
 
     if len(available_docs) < 2:
-        st.warning("⚠️ Please upload at least 2 PDF documents in the sidebar to perform Policy Gap Analysis.")
+        st.warning("⚠️ Please upload at least 2 documents (PDF, Excel, or Word) in the sidebar to perform Policy Gap Analysis.")
     else:
         col_doc_a, col_doc_b = st.columns(2)
         with col_doc_a:
@@ -556,28 +889,54 @@ with tab_compare:
             # Clean and sanitize filenames for safe OS download across Windows, Linux, and Mac
             clean_name_a = re.sub(r'[^a-zA-Z0-9_-]', '_', str(c_data.get('doc_a', 'DocA')).rsplit('.', 1)[0])[:25]
             clean_name_b = re.sub(r'[^a-zA-Z0-9_-]', '_', str(c_data.get('doc_b', 'DocB')).rsplit('.', 1)[0])[:25]
-            export_filename = f"ITU_Gap_Analysis_{clean_name_a}_vs_{clean_name_b}.md"
-
-            # Formatted Markdown export with official header
+            export_filename = f"ITU_Gap_Analysis_{clean_name_a}_vs_{clean_name_b}.pdf"
+            
             markdown_content = (
                 f"# ITU AI Readiness 2.0 — Policy Gap Analysis\n\n"
                 f"- **Document A:** {c_data.get('doc_a')}\n"
-                f"- **Document B:** {c_data.get('doc_b')}\n"
-                f"- **Framework:** ITU AI Readiness 2.0 (13 Official Dimensions & ITU-T Y.3172 Pipeline)\n\n"
-                f"---\n\n"
+                f"- **Document B:** {c_data.get('doc_b')}\n\n---\n\n"
                 f"{analysis_text}\n"
             )
 
+            # Generate PDF report
+            try:
+                pdf_bytes = generate_gap_analysis_pdf(
+                    doc_a=c_data.get('doc_a', ''),
+                    doc_b=c_data.get('doc_b', ''),
+                    analysis_text=analysis_text,
+                )
+                pdf_ready = True
+            except Exception as pdf_err:
+                pdf_ready = False
+                st.warning(f"PDF generation failed: {pdf_err}. Falling back to Markdown.")
+
             col_down, col_clear = st.columns([4, 1])
             with col_down:
-                st.download_button(
-                    label="📥 Download Gap Analysis / تحميل تقرير الفجوات (Markdown)",
-                    data=markdown_content.encode("utf-8"),
-                    file_name=export_filename,
-                    mime="text/markdown",
-                    key="btn_download_gap_analysis",
-                    use_container_width=True
-                )
+                if pdf_ready:
+                    import base64
+                    b64 = base64.b64encode(pdf_bytes).decode()
+                    btn_html = f'''
+                    <a href="data:application/pdf;base64,{b64}" download="{export_filename}"
+                       style="display: inline-block; width: 100%; text-align: center; padding: 0.5rem 1rem;
+                              color: white; background-color: #ff4b4b; border-radius: 0.5rem;
+                              text-decoration: none; font-weight: 500; font-family: sans-serif;
+                              box-sizing: border-box; font-size: 1rem;">
+                       📥 Download Gap Analysis / تحميل تقرير الفجوات (PDF)
+                    </a>
+                    <div style="height: 15px;"></div>
+                    '''
+                    st.markdown(btn_html, unsafe_allow_html=True)
+                else:
+                    # Fallback to Markdown if PDF generation failed
+                    md_filename = export_filename.replace(".pdf", ".md")
+                    st.download_button(
+                        label="📥 Download Gap Analysis (Markdown fallback)",
+                        data=markdown_content.encode("utf-8"),
+                        file_name=md_filename,
+                        mime="text/markdown",
+                        key="btn_download_gap_analysis",
+                        use_container_width=True
+                    )
             with col_clear:
                 if st.button("🗑️ Clear Results", key="btn_clear_comp_results", help="Clear current comparison results", use_container_width=True):
                     st.session_state.pop("last_comparison", None)

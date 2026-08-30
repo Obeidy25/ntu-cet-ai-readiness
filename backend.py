@@ -1,6 +1,6 @@
 """
 NTU CET - RAG Backend Server
-Provides PDF ingestion, ChromaDB vector storage, semantic sentence-aware chunking,
+Provides PDF, Excel, and DOCX ingestion, ChromaDB vector storage, semantic sentence-aware chunking,
 query routing, dynamic conversational onboarding, and hybrid multi-provider LLM generation.
 """
 
@@ -18,11 +18,13 @@ from PIL import Image
 from typing import Optional, List, Dict
 from openai import OpenAI
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import tempfile
 import chromadb
+import openpyxl
+from docx import Document as DocxDocument
 
 load_dotenv()
 
@@ -159,8 +161,8 @@ def delete_session_by_id(session_id: str) -> bool:
     return deleted
 
 
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
+CHUNK_SIZE = 800
+CHUNK_OVERLAP = 100
 
 ITU_AI_READINESS_DIMENSIONS = [
     "Data/model Marketplace",
@@ -179,13 +181,14 @@ ITU_AI_READINESS_DIMENSIONS = [
 ]
 
 
-def table_to_markdown(table_data):
+def table_to_markdown_chunks(table_data, max_rows=25):
     """
-    Converts a 2D list of extracted cell strings into a clean Markdown table format.
-    Handles empty cells, internal newlines, and column alignment.
+    Converts a 2D list of extracted cell strings into one or more Markdown tables.
+    Large tables are split into multiple chunks (default max 25 rows) while preserving the header.
+    Returns: List of Markdown table strings.
     """
     if not table_data or not table_data[0]:
-        return ""
+        return []
 
     cleaned_rows = []
     for row in table_data:
@@ -194,7 +197,7 @@ def table_to_markdown(table_data):
             cleaned_rows.append(cleaned_row)
 
     if not cleaned_rows:
-        return ""
+        return []
 
     num_cols = max(len(row) for row in cleaned_rows)
     normalized_rows = [row + [""] * (num_cols - len(row)) for row in cleaned_rows]
@@ -202,15 +205,25 @@ def table_to_markdown(table_data):
     header = normalized_rows[0]
     separator = ["---"] * num_cols
 
-    md_lines = [
-        "| " + " | ".join(header) + " |",
-        "| " + " | ".join(separator) + " |"
-    ]
+    if len(normalized_rows) == 1:
+        md_lines = [
+            "| " + " | ".join(header) + " |",
+            "| " + " | ".join(separator) + " |"
+        ]
+        return ["\n".join(md_lines)]
 
-    for row in normalized_rows[1:]:
-        md_lines.append("| " + " | ".join(row) + " |")
+    chunks = []
+    for i in range(1, len(normalized_rows), max_rows):
+        batch = normalized_rows[i : i + max_rows]
+        md_lines = [
+            "| " + " | ".join(header) + " |",
+            "| " + " | ".join(separator) + " |"
+        ]
+        for row in batch:
+            md_lines.append("| " + " | ".join(row) + " |")
+        chunks.append("\n".join(md_lines))
 
-    return "\n".join(md_lines)
+    return chunks
 
 
 def extract_text_and_tables(pdf_path):
@@ -235,11 +248,12 @@ def extract_text_and_tables(pdf_path):
         if tables and hasattr(tables, "tables"):
             for tab in tables.tables:
                 table_data = tab.extract()
-                md_table = table_to_markdown(table_data)
-                if md_table:
+                md_tables = table_to_markdown_chunks(table_data)
+                for idx, md_table in enumerate(md_tables):
+                    part = f" (Part {idx+1})" if len(md_tables) > 1 else ""
                     extracted_items.append((
                         page_num,
-                        f"[TABLE - Page {page_num}]\n{md_table}\n[/TABLE]",
+                        f"[TABLE - Page {page_num}{part}]\n{md_table}\n[/TABLE]",
                         "table"
                     ))
 
@@ -249,6 +263,86 @@ def extract_text_and_tables(pdf_path):
             extracted_items.append((page_num, text, "text"))
 
     doc.close()
+    return extracted_items
+
+
+def extract_text_from_excel(excel_path: str) -> List[tuple]:
+    """
+    Extracts structured content from an Excel file (.xlsx / .xls) using openpyxl.
+    Each sheet is treated as a "page". Tables are serialized as Markdown tables.
+    Returns: List of tuples (sheet_num, content_text, content_type)
+    """
+    wb = openpyxl.load_workbook(excel_path, data_only=True)
+    extracted_items = []
+
+    for sheet_num, sheet_name in enumerate(wb.sheetnames, start=1):
+        ws = wb[sheet_name]
+        rows = []
+        for row in ws.iter_rows(values_only=True):
+            # Skip completely empty rows
+            if any(cell is not None for cell in row):
+                rows.append([str(cell) if cell is not None else "" for cell in row])
+
+        if not rows:
+            continue
+
+        # Serialize all rows into Markdown table chunks
+        md_tables = table_to_markdown_chunks(rows, max_rows=30)
+        for idx, md_table in enumerate(md_tables):
+            part = f" (Part {idx+1})" if len(md_tables) > 1 else ""
+            extracted_items.append((
+                sheet_num,
+                f"[TABLE - Sheet {sheet_num}: {sheet_name}{part}]\n{md_table}\n[/TABLE]",
+                "table"
+            ))
+
+    wb.close()
+    return extracted_items
+
+
+def extract_text_from_docx(docx_path: str) -> List[tuple]:
+    """
+    Extracts structured content from a DOCX file using python-docx.
+    Paragraphs are grouped into pages (by section breaks / every 30 paragraphs).
+    Tables are serialized as Markdown tables.
+    Returns: List of tuples (page_num, content_text, content_type)
+    """
+    doc = DocxDocument(docx_path)
+    extracted_items = []
+    page_num = 1
+    paragraph_buffer = []
+    PARAGRAPHS_PER_PAGE = 30  # approximate grouping when no section breaks
+
+    # Extract tables first (with their approximate position)
+    for table in doc.tables:
+        rows = []
+        for row in table.rows:
+            rows.append([cell.text.strip() for cell in row.cells])
+        md_tables = table_to_markdown_chunks(rows)
+        for idx, md_table in enumerate(md_tables):
+            part = f" (Part {idx+1})" if len(md_tables) > 1 else ""
+            extracted_items.append((
+                page_num,
+                f"[TABLE - Page {page_num}{part}]\n{md_table}\n[/TABLE]",
+                "table"
+            ))
+
+    # Extract paragraph text, grouping into virtual pages
+    for i, para in enumerate(doc.paragraphs):
+        text = para.text.strip()
+        if text:
+            paragraph_buffer.append(text)
+
+        # Flush buffer every PARAGRAPHS_PER_PAGE paragraphs
+        if len(paragraph_buffer) >= PARAGRAPHS_PER_PAGE:
+            extracted_items.append((page_num, "\n".join(paragraph_buffer), "text"))
+            paragraph_buffer = []
+            page_num += 1
+
+    # Flush remaining paragraphs
+    if paragraph_buffer:
+        extracted_items.append((page_num, "\n".join(paragraph_buffer), "text"))
+
     return extracted_items
 
 
@@ -324,7 +418,7 @@ def describe_chart_image(base64_img: str, provider: str = "ollama", model: str =
 
     try:
         if provider == "gemini" and api_key:
-            gemini_model = model if "gemini" in model else "gemini-1.5-flash"
+            gemini_model = model if "gemini" in model else "gemini-2.5-flash"
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={api_key}"
             payload = {
                 "contents": [{
@@ -494,15 +588,30 @@ def embed_texts(texts):
     """
     Generates local embeddings via Ollama nomic-embed-text.
     Embeddings always run locally to ensure zero-cost, offline ingestion.
+    Includes robust retry logic and error handling for large files.
     """
+    import time
     embeddings = []
-    for text in texts:
-        response = requests.post(
-            f"{OLLAMA_URL}/api/embeddings",
-            json={"model": EMBEDDING_MODEL, "prompt": text}
-        )
-        response.raise_for_status()
-        embeddings.append(response.json()["embedding"])
+    for i, text in enumerate(texts):
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    f"{OLLAMA_URL}/api/embeddings",
+                    json={"model": EMBEDDING_MODEL, "prompt": text},
+                    timeout=120
+                )
+                response.raise_for_status()
+                embeddings.append(response.json()["embedding"])
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"Failed to embed chunk {i} after {max_retries} attempts: {e}")
+                    # Fallback to zero vector to prevent crashing the entire ingestion
+                    embeddings.append([0.0] * 768)
+                else:
+                    print(f"Embedding attempt {attempt+1} failed, retrying in {2**attempt}s...")
+                    time.sleep(2 ** attempt)
     return embeddings
 
 
@@ -513,7 +622,7 @@ Operating Guidelines:
 2. FACTUAL GROUNDING: Rely strictly on the provided context. Do NOT invent, assume, or fabricate facts beyond what is documented in the context.
 3. INSUFFICIENT INFORMATION: If the answer cannot be determined from the context, state clearly and politely in the query language that the information is not present in the provided documents.
 4. STRUCTURE & TONE: Maintain a polite, objective, and well-structured tone. Use clear markdown formatting (bullet points, bold text, concise paragraphs) for readability.
-5. MERMAID DIAGRAMS (ONLY ON EXPLICIT REQUEST): ONLY when the user explicitly requests a chart, diagram, illustration, or visual comparison, include a valid Mermaid diagram in a ```mermaid ... ``` code block. If the user does not request a diagram, provide a direct text response without apologizing or mentioning Mermaid."""
+5. MERMAID DIAGRAMS: CRITICAL: You MUST wrap all text inside nodes with double quotes to prevent syntax errors (e.g., A["Artificial Intelligence (AI)"] or B["الذكاء الاصطناعي"]). Do not use unquoted spaces, parentheses, or Arabic text inside node brackets."""
 
 
 COMPARE_SYSTEM_PROMPT = """You are an expert AI policy and document analyst specialized in comparative analysis and gap assessment.
@@ -527,11 +636,11 @@ Operating Guidelines:
    - Strategic and actionable recommendations
 3. Strict Factual Fidelity: Do not hallucinate or assume external policies. Cite the source document for each observation.
 4. Language Matching: Answer in the same language as the user query or primary document context.
-5. Visual Diagram: Conclude with a clean, valid Mermaid diagram in a ```mermaid ... ``` code block (such as graph TD or pie) summarizing the key comparative relationships or distributions visually."""
+5. Visual Diagram: Conclude with a clean, valid Mermaid diagram in a ```mermaid ... ``` code block (such as graph TD or pie) summarizing the key comparative relationships or distributions visually. CRITICAL: You MUST wrap all text inside Mermaid nodes with double quotes to prevent syntax errors (e.g., A["Artificial Intelligence (AI)"] or B["الذكاء الاصطناعي"]). Do not use unquoted spaces, parentheses, HTML tags, or Arabic text inside node brackets."""
 
 
-def generate_with_openai(prompt: str, model: str, api_key: str, system_prompt: Optional[str] = None, history: Optional[list] = None) -> str:
-    provider_client = OpenAI(api_key=api_key)
+def generate_with_openai(prompt: str, model: str, api_key: str, system_prompt: Optional[str] = None, history: Optional[list] = None, base_url: Optional[str] = None) -> str:
+    provider_client = OpenAI(api_key=api_key, base_url=base_url)
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -543,7 +652,8 @@ def generate_with_openai(prompt: str, model: str, api_key: str, system_prompt: O
 
     response = provider_client.chat.completions.create(
         model=model,
-        messages=messages
+        messages=messages,
+        timeout=120,
     )
     return response.choices[0].message.content
 
@@ -558,7 +668,7 @@ def generate_with_anthropic(prompt: str, model: str, api_key: str, system_prompt
 
     payload = {
         "model": model,
-        "max_tokens": 1024,
+        "max_tokens": 4096,
         "messages": messages,
     }
     if system_prompt:
@@ -572,6 +682,7 @@ def generate_with_anthropic(prompt: str, model: str, api_key: str, system_prompt
             "content-type": "application/json",
         },
         json=payload,
+        timeout=120,
     )
     response.raise_for_status()
     return response.json()["content"][0]["text"]
@@ -587,7 +698,8 @@ def generate_with_gemini(prompt: str, model: str, api_key: str, system_prompt: O
     contents.append({"role": "user", "parts": [{"text": prompt}]})
 
     payload = {
-        "contents": contents
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": 4096},
     }
     if system_prompt:
         payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
@@ -595,7 +707,33 @@ def generate_with_gemini(prompt: str, model: str, api_key: str, system_prompt: O
     response = requests.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
         json=payload,
+        timeout=120,
     )
+    # If model not found (404) or forbidden (403), try fallbacks
+    if response.status_code in [404, 403]:
+        for fallback in ["gemini-pro-latest", "gemini-3.1-pro-preview", "gemini-2.5-flash"]:
+            if fallback == model:
+                continue
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{fallback}:generateContent?key={api_key}",
+                json=payload,
+                timeout=120,
+            )
+            if response.status_code not in [404, 403]:
+                break
+    # Handle rate limiting with retry
+    if response.status_code == 429:
+        import time as _time
+        for wait in [5, 15, 30]:
+            print(f"Gemini rate limited, retrying in {wait}s...")
+            _time.sleep(wait)
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}",
+                json=payload,
+                timeout=120,
+            )
+            if response.status_code != 429:
+                break
     response.raise_for_status()
     return response.json()["candidates"][0]["content"]["parts"][0]["text"]
 
@@ -630,11 +768,18 @@ def generate_answer(prompt: str, provider: str, model: str, api_key: Optional[st
         return generate_with_ollama(prompt, model, system_prompt=system_prompt, history=history, max_tokens=max_tokens)
     if provider == "openai":
         return generate_with_openai(prompt, model, api_key, system_prompt=system_prompt, history=history)
+    if provider == "deepseek":
+        return generate_with_openai(prompt, model, api_key, system_prompt=system_prompt, history=history, base_url="https://api.deepseek.com")
+    if provider == "moonshot":
+        return generate_with_openai(prompt, model, api_key, system_prompt=system_prompt, history=history, base_url="https://api.moonshot.cn/v1")
     if provider == "anthropic":
         return generate_with_anthropic(prompt, model, api_key, system_prompt=system_prompt, history=history)
     if provider == "gemini":
         return generate_with_gemini(prompt, model, api_key, system_prompt=system_prompt, history=history)
     raise ValueError(f"Unknown provider: {provider}")
+
+
+ALLOWED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".docx"}
 
 
 @app.post("/ingest")
@@ -645,8 +790,19 @@ async def ingest(
     vision_model: str = Form("llama3.2-vision"),
     vision_api_key: Optional[str] = Form(None),
 ):
-    """Uploads, extracts text, structured tables, and optionally visual charts into ChromaDB with concurrency protection."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+    """Uploads, extracts text, structured tables, and optionally visual charts into ChromaDB with concurrency protection.
+    Supports PDF, Excel (.xlsx/.xls), and Word (.docx) files.
+    """
+    # Validate file extension
+    _, file_ext = os.path.splitext(file.filename or "")
+    file_ext = file_ext.lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{file_ext}'. Allowed types: PDF, Excel (.xlsx/.xls), Word (.docx)."
+        )
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
         content = await file.read()
         tmp.write(content)
         tmp_path = tmp.name
@@ -654,11 +810,22 @@ async def ingest(
     async with chroma_write_lock:
         collection = get_or_create_collection()
 
-        items = extract_text_and_tables(tmp_path)
+        # Route extraction based on file type
+        if file_ext == ".pdf":
+            items = extract_text_and_tables(tmp_path)
+        elif file_ext in (".xlsx", ".xls"):
+            items = extract_text_from_excel(tmp_path)
+        elif file_ext == ".docx":
+            items = extract_text_from_docx(tmp_path)
+        else:
+            items = []
         all_chunks = []
         all_metadata = []
         all_ids = []
-        chunk_index = collection.count()
+        
+        # Deterministic IDs
+        safe_filename = "".join([c if c.isalnum() else "_" for c in file.filename])
+        local_chunk_idx = 0
 
         for page_num, content_text, content_type in items:
             if content_type == "table":
@@ -668,11 +835,11 @@ async def ingest(
                     "page": page_num,
                     "content_type": "table",
                 })
-                all_ids.append(f"chunk_{chunk_index}")
-                chunk_index += 1
+                all_ids.append(f"{safe_filename}_p{page_num}_{local_chunk_idx}")
+                local_chunk_idx += 1
             else:
                 for chunk in chunk_text(content_text):
-                    if len(chunk.strip()) < 50:
+                    if len(chunk.strip()) < 20:
                         continue
                     all_chunks.append(chunk)
                     all_metadata.append({
@@ -680,12 +847,12 @@ async def ingest(
                         "page": page_num,
                         "content_type": "text",
                     })
-                    all_ids.append(f"chunk_{chunk_index}")
-                    chunk_index += 1
+                    all_ids.append(f"{safe_filename}_p{page_num}_{local_chunk_idx}")
+                    local_chunk_idx += 1
 
-        # Process Visual Charts with Vision AI if requested
+        # Process Visual Charts with Vision AI if requested (PDF only)
         figures_count = 0
-        if enable_vision:
+        if enable_vision and file_ext == ".pdf":
             extracted_images = extract_pdf_images(tmp_path)
             for img in extracted_images:
                 page_num = img["page"]
@@ -703,22 +870,45 @@ async def ingest(
                     "page": page_num,
                     "content_type": "figure",
                 })
-                all_ids.append(f"chunk_{chunk_index}")
-                chunk_index += 1
+                all_ids.append(f"{safe_filename}_p{page_num}_{local_chunk_idx}")
+                local_chunk_idx += 1
                 figures_count += 1
 
-        all_embeddings = []
+        chunks_added = 0
+        # Checkpoint Resumption & Batch Upsert Logic
         for i in range(0, len(all_chunks), 100):
-            batch = all_chunks[i : i + 100]
-            all_embeddings.extend(embed_texts(batch))
-
-        # Store in ChromaDB
-        collection.add(
-            documents=all_chunks,
-            embeddings=all_embeddings,
-            metadatas=all_metadata,
-            ids=all_ids,
-        )
+            batch_texts = all_chunks[i : i + 100]
+            batch_meta = all_metadata[i : i + 100]
+            batch_ids = all_ids[i : i + 100]
+            
+            # Check which IDs already exist in ChromaDB
+            existing = collection.get(ids=batch_ids)
+            existing_ids = set(existing.get("ids", []))
+            
+            # Filter to only the new un-embedded chunks
+            new_texts = []
+            new_meta = []
+            new_ids = []
+            
+            for t, m, i_d in zip(batch_texts, batch_meta, batch_ids):
+                if i_d not in existing_ids:
+                    new_texts.append(t)
+                    new_meta.append(m)
+                    new_ids.append(i_d)
+                    
+            if new_texts:
+                # Embed and save only the new chunks
+                new_embeddings = embed_texts(new_texts)
+                collection.upsert(
+                    documents=new_texts,
+                    embeddings=new_embeddings,
+                    metadatas=new_meta,
+                    ids=new_ids,
+                )
+                chunks_added += len(new_texts)
+                print(f"Ingested {len(new_texts)} new chunks (skipped {len(batch_texts) - len(new_texts)} existing).")
+            else:
+                print(f"Skipped {len(batch_texts)} existing chunks. Resuming...")
 
         total_chunks = collection.count()
 
@@ -727,7 +917,7 @@ async def ingest(
 
     return {
         "message": f"Ingested {file.filename} successfully",
-        "chunks_added": len(all_chunks),
+        "chunks_added": chunks_added,
         "figures_analyzed": figures_count,
         "total_chunks": total_chunks,
     }
@@ -842,9 +1032,8 @@ def detect_target_documents(question: str, doc_names: list):
 
 def generate_dynamic_greeting(collection, user_message: str, provider: str, model: str, api_key: Optional[str]) -> str:
     """
-    Generates an immediate, beautifully structured conversational onboarding greeting:
-    Greets politely in matching language, lists actual documents factually,
-    and proposes specific discussion starter questions with zero latency and zero hallucination risk.
+    Generates a conversational onboarding greeting.
+    Uses the LLM to generate highly relevant, context-aware starter questions based on actual document chunks.
     """
     is_ar = is_arabic(user_message)
 
@@ -858,46 +1047,72 @@ def generate_dynamic_greeting(collection, user_message: str, provider: str, mode
         else:
             return (
                 "Hello and welcome to your AI Document Assistant! 📚\n\n"
-                "No documents have been uploaded to the knowledge base yet. Please upload a PDF using the sidebar "
+                "No documents have been uploaded to the knowledge base yet. Please upload a document using the sidebar "
                 "so we can analyze and explore it together."
             )
 
-    all_items = collection.get(include=["metadatas"])
-    doc_names = list(dict.fromkeys(m.get("source", "Document") for m in all_items["metadatas"]))
+    # Retrieve a diverse sample of documents to generate smart questions
+    meta_items = collection.get(include=["metadatas"])
+    doc_names = list(dict.fromkeys(m.get("source", "Document") for m in meta_items.get("metadatas", [])))
+
+    sample_texts = []
+    for source in doc_names[:3]:
+        res = collection.get(where={"source": source}, include=["documents"], limit=1)
+        if res and res.get("documents"):
+            sample_texts.append(f"[Document: {source}]\n{res['documents'][0]}")
+
+    smart_questions = ""
+    try:
+        context_sample = "\n\n".join(sample_texts)
+        
+        if is_ar:
+            prompt = f"بناءً على هذه المقتطفات من المستندات:\n{context_sample}\n\nاقترح 3 أسئلة مفيدة ومحددة جداً يمكن للمستخدم طرحها لاستكشاف هذا المحتوى. اكتب الأسئلة فقط في قائمة مرقمة (1. ، 2. ، 3.) بدون أي مقدمات أو خاتمة."
+            sys_prompt = "أنت مساعد ذكي. أخرج قائمة مرقمة بالأسئلة فقط."
+        else:
+            prompt = f"Based on these document excerpts:\n{context_sample}\n\nSuggest 3 specific and insightful questions the user could ask to explore this content. Write only the questions as a numbered list (1., 2., 3.) without any intro or outro."
+            sys_prompt = "You are a helpful assistant. Output only the requested numbered list."
+            
+        smart_questions = generate_answer(
+            prompt, provider, model, api_key,
+            system_prompt=sys_prompt,
+            max_tokens=150
+        )
+    except Exception as e:
+        # Fallback to hardcoded generic questions if LLM fails
+        if is_ar:
+            q1 = f"ما هي الأهداف والنتائج الرئيسية المذكورة في {doc_names[0]}؟" if doc_names else "ما هي الأهداف الرئيسية؟"
+            q2 = f"ما هي أهم الحلول والبيانات المطروحة في {doc_names[1]}؟" if len(doc_names) > 1 else "ما هي أهم النتائج والبيانات المذكورة في المستند؟"
+            q3 = "قارن بين المستندات المرفوعة واستنتج رسماً بيانياً توضيحياً للفروقات." if len(doc_names) > 1 else "لخص لي أهم محاور وجداول هذا المستند."
+            smart_questions = f"1. {q1}\n2. {q2}\n3. {q3}"
+        else:
+            q1 = f"What are the main objectives and findings in {doc_names[0]}?" if doc_names else "What are the main objectives?"
+            q2 = f"How does {doc_names[1]} address its core topic?" if len(doc_names) > 1 else "What are the practical applications and recommendations mentioned?"
+            q3 = "Compare the uploaded documents and generate a visual chart." if len(doc_names) > 1 else "Summarize the key data and tables in the document."
+            smart_questions = f"1. {q1}\n2. {q2}\n3. {q3}"
 
     if is_ar:
         docs_str = "\n".join([f"- 📄 **{name}**" for name in doc_names])
-        q1 = f"ما هي الأهداف والنتائج الرئيسية المذكورة في {doc_names[0]}؟"
-        q2 = f"ما هي أهم الحلول والبيانات المطروحة في {doc_names[1]}؟" if len(doc_names) > 1 else "ما هي أهم النتائج والبيانات المذكورة في المستند؟"
-        q3 = "قارن بين المستندات المرفوعة واستنتج رسماً بيانياً توضيحياً للفروقات." if len(doc_names) > 1 else "لخص لي أهم محاور وجداول هذا المستند."
         return (
             f"وعليكم السلام ورحمة الله وبركاته! أهلاً وسهلاً بك. 📚✨\n\n"
-            f"**المستندات المتاحة حالياً في قاعدة المعرفة ({len(doc_names)} مستندات):**\n{docs_str}\n\n"
-            f"**محاور وأسئلة مقترحة لبدء النقاش:**\n"
-            f"1. {q1}\n"
-            f"2. {q2}\n"
-            f"3. {q3}\n\n"
+            f"**المستندات المتاحة حالياً في قاعدة المعرفة:**\n{docs_str}\n\n"
+            f"**أسئلة مقترحة لبدء النقاش (بناءً على محتوى ملفاتك):**\n"
+            f"{smart_questions.strip()}\n\n"
             f"تفضل بطرح أي سؤال للبدء في استكشاف وتحليل المحتوى!"
         )
     else:
         docs_str = "\n".join([f"- 📄 **{name}**" for name in doc_names])
-        q1 = f"What are the main objectives and findings in {doc_names[0]}?"
-        q2 = f"How does {doc_names[1]} address its core topic?" if len(doc_names) > 1 else "What are the practical applications and recommendations mentioned?"
-        q3 = "Compare the uploaded documents and generate a visual chart." if len(doc_names) > 1 else "Summarize the key data and tables in the document."
         return (
             f"Hello and welcome! 📚✨\n\n"
-            f"**Documents currently in your knowledge base ({len(doc_names)} documents):**\n{docs_str}\n\n"
-            f"**Suggested starter questions:**\n"
-            f"1. {q1}\n"
-            f"2. {q2}\n"
-            f"3. {q3}\n\n"
+            f"**Documents currently in your knowledge base:**\n{docs_str}\n\n"
+            f"**Suggested starter questions (based on your documents):**\n"
+            f"{smart_questions.strip()}\n\n"
             f"Feel free to ask any question to begin exploring!"
         )
 
 
 class AskRequest(BaseModel):
     question: str
-    n_results: int = 3
+    n_results: int = 5
     provider: str = "ollama"               # "ollama" | "openai" | "anthropic" | "gemini"
     model: str = "llama3.1"                # Target model identifier
     api_key: Optional[str] = None          # Optional API key for cloud providers
@@ -956,10 +1171,10 @@ async def ask(request: AskRequest):
     if collection.count() == 0:
         return {"error": "No documents ingested yet"}
 
-    # Filter and preserve a clean sliding window of the last 4 messages (last 2 full turns)
+    # Filter and preserve a clean sliding window of the last 6 messages (last 3 full turns)
     valid_history = []
     if request.history:
-        for turn in request.history[-4:]:
+        for turn in request.history[-6:]:
             if isinstance(turn, dict) and "role" in turn and "content" in turn:
                 valid_history.append({"role": turn["role"], "content": turn["content"]})
 
@@ -1273,11 +1488,39 @@ Focus on: (1) topics covered in one document but missing in the other, (2) diffe
 === Document B: {request.doc_b} ===
 {text_b}
 
-Provide your analysis in exactly this format:
-1. Topics only in Document A (organized by ITU dimension, using headers)
-2. Topics only in Document B (organized by ITU dimension, using headers)
-3. Shared topics with notable differences (organized by ITU dimension, using headers)
-4. Recommendations to close the gaps (organized by ITU dimension, using headers)
+Provide your analysis in exactly this format, using STRICT Markdown pipe-tables:
+
+## 1. Topics only in Document A
+
+| Dimension | Evidence |
+|---|---|
+| Strategy Alignment | "Quote from document..." (Document A) |
+| Digital Infrastructure | "Quote from document..." (Document A) |
+
+## 2. Topics only in Document B
+
+| Dimension | Evidence |
+|---|---|
+| Digital Infrastructure | "Quote from document..." (Document B) |
+
+## 3. Shared topics with notable differences
+
+| Dimension | Document A | Document B | Differences |
+|---|---|---|---|
+| Strategy Alignment | AI is tied to Vision 2030... | Health system vision without AI... | A integrates AI; B does not. |
+
+## 4. Recommendations to close the gaps
+
+| Dimension | Recommendation |
+|---|---|
+| AI & Policies | Draft a national AI governance framework... |
+
+CRITICAL RULES:
+- You MUST use the pipe character '|' for EVERY table row. Every single data row must start and end with '|'.
+- Include the separator line '|---|---|' after each header row.
+- Do NOT output plain-text columnar layouts. ONLY use pipe-delimited Markdown tables.
+- If quoting Arabic text from documents, provide an English translation in parentheses after the Arabic quote.
+- Keep each table cell on a SINGLE line (no line breaks inside cells).
 """
 
     if request.provider != "ollama" and not request.api_key:
@@ -1298,24 +1541,30 @@ Provide your analysis in exactly this format:
     return {"doc_a": request.doc_a, "doc_b": request.doc_b, "analysis": analysis}
 
 
+last_known_local_models = []
+
 @app.get("/models")
 def available_models():
     """
     Discovers installed local Ollama models automatically,
     and returns supported cloud providers and standard models.
     """
+    global last_known_local_models
     local_models = []
     try:
-        resp = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2)
+        resp = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
         resp.raise_for_status()
         local_models = [m["name"] for m in resp.json().get("models", [])]
+        last_known_local_models = local_models
     except Exception:
-        pass
+        local_models = last_known_local_models
 
     cloud_providers = {
         "openai": ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo"],
         "anthropic": ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"],
-        "gemini": ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+        "gemini": ["gemini-pro-latest", "gemini-3.1-pro-preview", "gemini-2.5-flash", "gemini-2.5-pro"],
+        "deepseek": ["deepseek-chat", "deepseek-reasoner"],
+        "moonshot": ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
     }
 
     return {
@@ -1348,17 +1597,28 @@ async def verify_key_endpoint(request: VerifyKeyRequest):
         "openai": {"context_tokens": "128,000 Tokens", "tier": "GPT-4o Enterprise Reasoning"},
         "anthropic": {"context_tokens": "200,000 Tokens", "tier": "Claude 3.5 Sonnet Precision"},
         "gemini": {"context_tokens": "1,000,000 Tokens", "tier": "Gemini 1.5 Pro Extreme Context"},
+        "deepseek": {"context_tokens": "64,000 Tokens", "tier": "DeepSeek V3 / Reasoner"},
+        "moonshot": {"context_tokens": "128,000 Tokens", "tier": "Moonshot Kimi Context"},
     }
 
     try:
-        if provider == "openai":
-            client = OpenAI(api_key=api_key)
+        if provider in ["openai", "deepseek", "moonshot"]:
+            base_url = None
+            if provider == "deepseek":
+                base_url = "https://api.deepseek.com"
+            elif provider == "moonshot":
+                base_url = "https://api.moonshot.cn/v1"
+            
+            client = OpenAI(api_key=api_key, base_url=base_url)
             client.models.list()
-            limit_info = token_limits.get("openai", {"context_tokens": "128,000 Tokens", "tier": "OpenAI Cloud"})
+            
+            limit_info = token_limits.get(provider, {"context_tokens": "128,000 Tokens", "tier": "Cloud Model"})
+            provider_name = provider.capitalize() if provider != "openai" else "OpenAI"
+            
             return {
                 "status": "connected",
-                "provider": "OpenAI",
-                "message": f"Successfully connected to OpenAI! ({limit_info['tier']})",
+                "provider": provider_name,
+                "message": f"Successfully connected to {provider_name}! ({limit_info['tier']})",
                 "context_tokens": limit_info["context_tokens"],
             }
         elif provider == "anthropic":
@@ -1387,19 +1647,22 @@ async def verify_key_endpoint(request: VerifyKeyRequest):
             else:
                 return {"status": "error", "message": f"Anthropic key validation failed (Status {test_resp.status_code})"}
         elif provider == "gemini":
-            test_model = model if model else "gemini-1.5-flash"
-            test_resp = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{test_model}:generateContent?key={api_key}",
-                json={"contents": [{"role": "user", "parts": [{"text": "ping"}]}]},
+            # Use models.list endpoint for reliable key validation (no 404 risk from model names)
+            test_resp = requests.get(
+                f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
                 timeout=10,
             )
             if test_resp.status_code == 200:
+                # Parse available model names for display
+                available_models = [m.get("name", "").replace("models/", "") for m in test_resp.json().get("models", [])]
+                gemini_models = [m for m in available_models if "gemini" in m][:5]
                 limit_info = token_limits.get("gemini", {"context_tokens": "1,000,000 Tokens", "tier": "Google Gemini Cloud"})
                 return {
                     "status": "connected",
                     "provider": "Google Gemini",
                     "message": f"Successfully connected to Google Gemini! ({limit_info['tier']})",
                     "context_tokens": limit_info["context_tokens"],
+                    "available_models": gemini_models,
                 }
             else:
                 return {"status": "error", "message": f"Google Gemini key validation failed (Status {test_resp.status_code})"}
